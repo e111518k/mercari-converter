@@ -117,31 +117,58 @@ def fetch_rakuten_product(url: str) -> RakutenProduct:
     }
     resp = requests.get(url, headers=headers, timeout=15)
     resp.raise_for_status()
-    # エンコーディングを自動検出（強制UTF-8にしない）
-    if resp.encoding and resp.encoding.lower() in ("utf-8", "utf8"):
-        soup = BeautifulSoup(resp.text, "html.parser")
-    else:
-        soup = BeautifulSoup(resp.content, "html.parser", from_encoding=resp.apparent_encoding)
+    # 楽天はEUC-JPページが多いため、raw bytesを複数エンコーディングで試みる
+    html_text = None
+    for enc in [resp.encoding, "euc-jp", "utf-8", "cp932", "shift_jis"]:
+        if not enc:
+            continue
+        try:
+            html_text = resp.content.decode(enc)
+            break
+        except Exception:
+            pass
+    if html_text is None:
+        html_text = resp.content.decode("utf-8", errors="replace")
+    soup = BeautifulSoup(html_text, "html.parser")
 
     product = RakutenProduct()
 
     # --- 商品名 ---
-    # 1) itemInfoSku.title（JSON内、文字化け再デコード対応）
     item_json_pre = _extract_item_json(soup)
     raw_name = ""
+
+    # 1) itemNameEnc（URLエンコードされた正確なタイトル）
     if item_json_pre:
-        raw_name = _decode_selector_value(item_json_pre.get("title", ""))
-    # 2) og:title フォールバック
-    if not raw_name or "\ufffd" in raw_name:
+        enc_name = item_json_pre.get("itemNameEnc", "")
+        if enc_name:
+            from urllib.parse import unquote
+            for title_enc in ("euc-jp", "utf-8", "shift_jis"):
+                try:
+                    decoded = unquote(enc_name.replace("+", " "), encoding=title_enc)
+                    if "\ufffd" not in decoded:
+                        raw_name = decoded
+                        break
+                except Exception:
+                    pass
+
+    # 2) itemInfoSku.title（JSON直接）
+    if not raw_name and item_json_pre:
+        t = item_json_pre.get("title", "")
+        if t and "\ufffd" not in t:
+            raw_name = t
+
+    # 3) og:title フォールバック
+    if not raw_name:
         og_title = soup.find("meta", property="og:title")
         og_raw = og_title["content"].strip() if og_title and og_title.get("content") else ""
-        og_decoded = _decode_selector_value(og_raw)
-        if og_decoded and "\ufffd" not in og_decoded:
-            raw_name = og_decoded
-    # 3) h1 フォールバック
-    if not raw_name or "\ufffd" in raw_name:
+        if og_raw and "\ufffd" not in og_raw:
+            raw_name = og_raw
+
+    # 4) h1 フォールバック
+    if not raw_name:
         h1 = soup.find("h1")
         raw_name = h1.get_text(strip=True) if h1 else ""
+
     raw_name = re.sub(r"^【[^】]*】", "", raw_name).strip()
     raw_name = re.sub(r"[：:][^：:]+$", "", raw_name).strip()
     product.name = raw_name[:130]
