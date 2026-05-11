@@ -70,7 +70,7 @@ def debug():
     item_json = _extract_item_json(soup)
     enc_name = item_json.get("itemNameEnc", "")[:80] if item_json else ""
     title = item_json.get("title", "")[:80] if item_json else ""
-    return jsonify({"resp_encoding": resp.encoding, "tried": tried, "enc_name": enc_name, "title_field": title, "html_len": len(html_text or "")})
+    return jsonify({"resp_encoding": resp.encoding, "status_code": resp.status_code, "tried": tried, "enc_name": enc_name, "title_field": title, "html_len": len(html_text or ""), "html_preview": (html_text or "")[:200], "headers": dict(resp.headers)})
 
 
 @app.route("/api/download", methods=["POST"])
