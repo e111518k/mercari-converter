@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>楽天 → メルカリShops 変換</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f5f5f5; color: #333; }
+
+    header { background: #ff0211; color: white; padding: 16px 24px; display: flex; align-items: center; gap: 12px; }
+    header h1 { font-size: 18px; font-weight: 700; }
+    header span { font-size: 13px; opacity: .8; }
+
+    .container { max-width: 900px; margin: 32px auto; padding: 0 16px; }
+
+    .card { background: white; border-radius: 12px; padding: 24px; margin-bottom: 24px; box-shadow: 0 1px 4px rgba(0,0,0,.08); }
+    .card h2 { font-size: 15px; font-weight: 700; margin-bottom: 16px; color: #555; text-transform: uppercase; letter-spacing: .05em; }
+
+    textarea { width: 100%; border: 1.5px solid #ddd; border-radius: 8px; padding: 12px; font-size: 14px; resize: vertical; min-height: 100px; outline: none; transition: border-color .2s; }
+    textarea:focus { border-color: #ff0211; }
+
+    .options { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 12px; margin-top: 16px; }
+    .option label { display: block; font-size: 12px; color: #888; margin-bottom: 4px; }
+    .option input, .option select { width: 100%; border: 1.5px solid #ddd; border-radius: 6px; padding: 8px 10px; font-size: 14px; outline: none; }
+    .option input:focus, .option select:focus { border-color: #ff0211; }
+
+    .btn { display: inline-flex; align-items: center; gap: 8px; padding: 12px 28px; border: none; border-radius: 8px; font-size: 15px; font-weight: 600; cursor: pointer; transition: opacity .15s; }
+    .btn:hover { opacity: .85; }
+    .btn:disabled { opacity: .4; cursor: not-allowed; }
+    .btn-primary { background: #ff0211; color: white; }
+    .btn-success { background: #00b900; color: white; }
+    .btn-row { display: flex; gap: 12px; margin-top: 20px; flex-wrap: wrap; }
+
+    .spinner { width: 18px; height: 18px; border: 2px solid rgba(255,255,255,.4); border-top-color: white; border-radius: 50%; animation: spin .6s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    #results { display: none; }
+    .result-item { display: flex; align-items: flex-start; gap: 16px; padding: 16px 0; border-bottom: 1px solid #f0f0f0; }
+    .result-item:last-child { border-bottom: none; }
+    .result-thumb { width: 72px; height: 72px; object-fit: cover; border-radius: 8px; background: #eee; flex-shrink: 0; }
+    .result-info { flex: 1; min-width: 0; }
+    .result-info .name { font-size: 14px; font-weight: 600; margin-bottom: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .result-info .meta { font-size: 12px; color: #888; }
+    .result-info .meta span { margin-right: 12px; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 20px; font-size: 11px; font-weight: 600; }
+    .badge-ok { background: #e6f9e6; color: #00b900; }
+    .badge-err { background: #ffe6e6; color: #cc0000; }
+    .error-msg { font-size: 12px; color: #cc0000; margin-top: 4px; }
+
+    .empty { text-align: center; padding: 48px; color: #aaa; font-size: 14px; }
+    .count-badge { background: #ff0211; color: white; border-radius: 20px; padding: 2px 10px; font-size: 13px; margin-left: 8px; }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>楽天 → メルカリShops 変換ツール</h1>
+  <span>URLを入力してCSVを生成</span>
+</header>
+
+<div class="container">
+
+  <div class="card">
+    <h2>商品URL入力</h2>
+    <textarea id="urls" placeholder="楽天の商品ページURLを1行に1つ入力&#10;例: https://item.rakuten.co.jp/hargio/ba-0002-0036/"></textarea>
+
+    <div class="options">
+      <div class="option">
+        <label>在庫数</label>
+        <input type="number" id="stock" value="1" min="0">
+      </div>
+    </div>
+
+    <div class="btn-row">
+      <button class="btn btn-primary" id="convertBtn" onclick="startConvert()">
+        変換する
+      </button>
+    </div>
+  </div>
+
+  <div class="card" id="results">
+    <h2>
+      変換結果
+      <span class="count-badge" id="countBadge">0</span>
+    </h2>
+    <div id="resultList"></div>
+    <div class="btn-row" id="downloadRow" style="display:none">
+      <button class="btn btn-success" onclick="downloadCSV()">
+        CSVをダウンロード
+      </button>
+    </div>
+  </div>
+
+</div>
+
+<script>
+let convertedRows = [];
+
+async function startConvert() {
+  const urlText = document.getElementById("urls").value.trim();
+  if (!urlText) { alert("URLを入力してください"); return; }
+
+  const urls = urlText.split("\n").map(u => u.trim()).filter(Boolean);
+  const btn = document.getElementById("convertBtn");
+  btn.disabled = true;
+  btn.innerHTML = '<div class="spinner"></div> 取得中...';
+
+  const payload = {
+    urls,
+    stock: parseInt(document.getElementById("stock").value) || 1,
+  };
+
+  try {
+    const res = await fetch("/api/convert", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const results = await res.json();
+    showResults(results);
+  } catch (e) {
+    alert("エラーが発生しました: " + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = "変換する";
+  }
+}
+
+function showResults(results) {
+  const section = document.getElementById("results");
+  const list = document.getElementById("resultList");
+  const badge = document.getElementById("countBadge");
+  const downloadRow = document.getElementById("downloadRow");
+
+  section.style.display = "block";
+  convertedRows = results.filter(r => r.success).map(r => r.row);
+  badge.textContent = results.length;
+
+  if (results.length === 0) {
+    list.innerHTML = '<div class="empty">結果がありません</div>';
+    downloadRow.style.display = "none";
+    return;
+  }
+
+  list.innerHTML = results.map(r => {
+    if (!r.success) {
+      return `<div class="result-item">
+        <div class="result-info">
+          <div class="name">${escHtml(r.url)}</div>
+          <span class="badge badge-err">エラー</span>
+          <div class="error-msg">${escHtml(r.error)}</div>
+        </div>
+      </div>`;
+    }
+    const img = r.image
+      ? `<img class="result-thumb" src="${escHtml(r.image)}" onerror="this.style.display='none'">`
+      : `<div class="result-thumb"></div>`;
+    return `<div class="result-item">
+      ${img}
+      <div class="result-info">
+        <div class="name">${escHtml(r.name || "(商品名なし)")}</div>
+        <div class="meta">
+          <span>価格: ${r.price ? "¥" + Number(r.price).toLocaleString() : "未取得"}</span>
+          <span>SKU: ${r.sku_count}件</span>
+        </div>
+        <span class="badge badge-ok">変換OK</span>
+      </div>
+    </div>`;
+  }).join("");
+
+  downloadRow.style.display = convertedRows.length > 0 ? "flex" : "none";
+  section.scrollIntoView({ behavior: "smooth" });
+}
+
+async function downloadCSV() {
+  const res = await fetch("/api/download", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ rows: convertedRows }),
+  });
+  const blob = await res.blob();
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "mercari_import.csv";
+  a.click();
+}
+
+function escHtml(s) {
+  return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+}
+</script>
+</body>
+</html>
