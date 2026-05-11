@@ -44,6 +44,35 @@ def convert():
     return jsonify(results)
 
 
+@app.route("/api/debug")
+def debug():
+    import requests as _req
+    url = request.args.get("url", "https://item.rakuten.co.jp/hargio/ib-0001-0061/")
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36", "Accept-Language": "ja,en;q=0.9"}
+    resp = _req.get(url, headers=headers, timeout=15)
+    _PERMISSIVE = {"iso-8859-1", "latin-1", "latin1", "iso8859-1"}
+    tried = {}
+    html_text = None
+    for enc in [resp.encoding, "euc-jp", "utf-8", "cp932", "shift_jis"]:
+        if not enc:
+            continue
+        try:
+            c = resp.content.decode(enc)
+            has_fffd = "\ufffd" in c
+            tried[enc] = f"ok, has_fffd={has_fffd}"
+            if not has_fffd and html_text is None and enc.lower() not in _PERMISSIVE:
+                html_text = c
+        except Exception as e:
+            tried[enc] = f"error: {e}"
+    from bs4 import BeautifulSoup
+    from rakuten_to_mercari import _extract_item_json
+    soup = BeautifulSoup(html_text or "", "html.parser")
+    item_json = _extract_item_json(soup)
+    enc_name = item_json.get("itemNameEnc", "")[:80] if item_json else ""
+    title = item_json.get("title", "")[:80] if item_json else ""
+    return jsonify({"resp_encoding": resp.encoding, "tried": tried, "enc_name": enc_name, "title_field": title, "html_len": len(html_text or "")})
+
+
 @app.route("/api/download", methods=["POST"])
 def download():
     data = request.get_json()

@@ -117,14 +117,17 @@ def fetch_rakuten_product(url: str) -> RakutenProduct:
     }
     resp = requests.get(url, headers=headers, timeout=15)
     resp.raise_for_status()
-    # 楽天はEUC-JPページが多いため、raw bytesを複数エンコーディングで試みる
+    # ISO-8859-1/latin-1 は全バイトを受け付けてしまい文字化けを検出できないためスキップ
+    _PERMISSIVE = {"iso-8859-1", "latin-1", "latin1", "iso8859-1"}
     html_text = None
     for enc in [resp.encoding, "euc-jp", "utf-8", "cp932", "shift_jis"]:
-        if not enc:
+        if not enc or enc.lower() in _PERMISSIVE:
             continue
         try:
-            html_text = resp.content.decode(enc)
-            break
+            candidate = resp.content.decode(enc)
+            if "\ufffd" not in candidate:
+                html_text = candidate
+                break
         except Exception:
             pass
     if html_text is None:
