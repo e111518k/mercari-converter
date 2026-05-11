@@ -106,7 +106,69 @@ def _extract_item_json(soup) -> dict:
     return {}
 
 
+def _fetch_via_api(url: str, app_id: str) -> RakutenProduct:
+    """楽天APIを使って商品データを取得（IPブロック回避）"""
+    import json as _json
+    m = re.search(r"item\.rakuten\.co\.jp/([^/]+)/([^/?#]+)", url)
+    if not m:
+        raise ValueError(f"URLが楽天商品ページの形式ではありません: {url}")
+    shop_code, item_id = m.group(1), m.group(2)
+
+    api_url = "https://app.rakuten.co.jp/services/api/IchibaItem/Search/20170706"
+    params = {
+        "applicationId": app_id,
+        "shopCode": shop_code,
+        "keyword": item_id,
+        "hits": 10,
+        "format": "json",
+    }
+    resp = requests.get(api_url, params=params, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+
+    items = data.get("Items", [])
+    if not items:
+        raise ValueError(f"商品が見つかりませんでした: {shop_code}/{item_id}")
+
+    # item_id が含まれる商品を優先
+    item = None
+    for entry in items:
+        i = entry.get("Item", entry)
+        if item_id.lower() in i.get("itemCode", "").lower():
+            item = i
+            break
+    if not item:
+        item = items[0].get("Item", items[0])
+
+    product = RakutenProduct()
+    raw_name = item.get("itemName", "")
+    raw_name = re.sub(r"^【[^】]*】", "", raw_name).strip()
+    raw_name = re.sub(r"[：:][^：:]+$", "", raw_name).strip()
+    product.name = raw_name[:130]
+    product.price = str(int(item.get("itemPrice", 0) or 0))
+    product.description = re.sub(r"<[^>]+>", "", item.get("itemCaption", ""))
+    product.item_code = item_id
+
+    # 画像（APIはmediumImageUrlsを返す）
+    for img in item.get("mediumImageUrls", []):
+        img_url = img.get("imageUrl", "") if isinstance(img, dict) else img
+        img_url = re.sub(r"\?.*$", "", img_url)
+        if img_url:
+            product.image_urls.append(img_url)
+
+    # SKU: APIにバリエーション情報がないため商品名から色を抽出
+    color = _extract_color(product.name + " " + product.description)
+    label = color if color else "標準"
+    product.skus.append({"種類": label, "在庫数": 1, "管理コード": item_id, "JAN": ""})
+
+    return product
+
+
 def fetch_rakuten_product(url: str) -> RakutenProduct:
+    import os
+    app_id = os.environ.get("RAKUTEN_APP_ID", "")
+
+    # HTMLスクレイピングを試みる（ローカル環境など）
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -115,24 +177,39 @@ def fetch_rakuten_product(url: str) -> RakutenProduct:
         ),
         "Accept-Language": "ja,en;q=0.9",
     }
-    resp = requests.get(url, headers=headers, timeout=15)
-    resp.raise_for_status()
-    # ISO-8859-1/latin-1 は全バイトを受け付けてしまい文字化けを検出できないためスキップ
-    _PERMISSIVE = {"iso-8859-1", "latin-1", "latin1", "iso8859-1"}
-    html_text = None
-    for enc in [resp.encoding, "euc-jp", "utf-8", "cp932", "shift_jis"]:
-        if not enc or enc.lower() in _PERMISSIVE:
-            continue
-        try:
-            candidate = resp.content.decode(enc)
-            if "\ufffd" not in candidate:
-                html_text = candidate
-                break
-        except Exception:
-            pass
-    if html_text is None:
-        html_text = resp.content.decode("utf-8", errors="replace")
-    soup = BeautifulSoup(html_text, "html.parser")
+    try:
+        resp = requests.get(url, headers=headers, timeout=15)
+        resp.raise_for_status()
+        # CDNブロック検出: 本文が短すぎる（正常ページは数万バイト）
+        if len(resp.content) < 1000:
+            raise ValueError("CDNブロックの可能性があります（レスポンスが短すぎます）")
+        # ISO-8859-1/latin-1 は全バイトを受け付けてしまい文字化けを検出できないためスキップ
+        _PERMISSIVE = {"iso-8859-1", "latin-1", "latin1", "iso8859-1"}
+        html_text = None
+        for enc in [resp.encoding, "euc-jp", "utf-8", "cp932", "shift_jis"]:
+            if not enc or enc.lower() in _PERMISSIVE:
+                continue
+            try:
+                candidate = resp.content.decode(enc)
+                if "\ufffd" not in candidate:
+                    html_text = candidate
+                    break
+            except Exception:
+                pass
+        if html_text is None:
+            html_text = resp.content.decode("utf-8", errors="replace")
+        soup = BeautifulSoup(html_text, "html.parser")
+
+        # JSONが取れなければスクレイピング失敗と判断してAPIにフォールバック
+        item_json_check = _extract_item_json(soup)
+        if not item_json_check and app_id:
+            return _fetch_via_api(url, app_id)
+        if not item_json_check:
+            raise ValueError("商品データが取得できませんでした。ページが正しく読み込めていません。")
+    except Exception as scrape_err:
+        if app_id:
+            return _fetch_via_api(url, app_id)
+        raise scrape_err
 
     product = RakutenProduct()
 
@@ -283,20 +360,71 @@ def fetch_rakuten_product(url: str) -> RakutenProduct:
             add_image(href)
 
     # --- 商品説明 ---
-    # 楽天の商品説明は #item-description, .item_desc などにあることが多い
-    desc_el = (
-        soup.select_one("#item-description")
-        or soup.select_one(".item_desc")
-        or soup.select_one("[id*='desc']")
-        or soup.select_one("[class*='description']")
-    )
-    if desc_el:
-        product.description = desc_el.get_text(separator="\n", strip=True)
-    else:
-        # og:description フォールバック
-        og_desc = soup.find("meta", property="og:description")
-        if og_desc:
-            product.description = og_desc.get("content", "")
+    _SKIP_LABELS = {"注意", "注意事項"}
+    _SPEC_LABELS = {"素材", "材質", "素材/材質", "サイズ", "寸法", "サイズ/寸法", "サイズ・寸法"}
+    _DESC_LABELS = {"商品説明", "商品詳細", "説明"}
+    _EXCLUDE_PHRASES = [
+        "モニター発色の具合により色合いが異なる場合がございます",
+        "モニターの発色の具合",
+        "色合いが異なる場合がございます",
+    ]
+
+    def clean_text(text: str) -> str:
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        lines = [l for l in lines if not any(p in l for p in _EXCLUDE_PHRASES)]
+        return "\n".join(lines)
+
+    # テーブル形式（th+td または td+td）の行をパース
+    main_desc = ""
+    spec_parts = []
+    seen_specs = set()
+
+    for row in soup.find_all("tr"):
+        cells = row.find_all(["th", "td"])
+        if len(cells) < 2:
+            continue
+        label = cells[0].get_text(strip=True)
+        value = cells[-1].get_text(separator="\n", strip=True)
+        if label in _SKIP_LABELS:
+            continue
+        if label in _DESC_LABELS:
+            main_desc = clean_text(value)
+        elif label in _SPEC_LABELS and label not in seen_specs:
+            seen_specs.add(label)
+            spec_parts.append(f"{label}：{value}")
+
+    # dl/dt/dd 形式にも対応
+    for dt in soup.find_all("dt"):
+        label = dt.get_text(strip=True)
+        if label in _SKIP_LABELS:
+            continue
+        dd = dt.find_next_sibling("dd")
+        if not dd:
+            continue
+        value = dd.get_text(separator="\n", strip=True)
+        if label in _DESC_LABELS and not main_desc:
+            main_desc = clean_text(value)
+        elif label in _SPEC_LABELS and label not in seen_specs:
+            seen_specs.add(label)
+            spec_parts.append(f"{label}：{value}")
+
+    # テーブルから取れなかった場合は既存セレクタで取得
+    if not main_desc:
+        desc_el = (
+            soup.select_one("#item-description")
+            or soup.select_one(".item_desc")
+            or soup.select_one("[id*='desc']")
+            or soup.select_one("[class*='description']")
+        )
+        if desc_el:
+            main_desc = clean_text(desc_el.get_text(separator="\n", strip=True))
+        else:
+            og_desc = soup.find("meta", property="og:description")
+            if og_desc:
+                main_desc = clean_text(og_desc.get("content", ""))
+
+    parts = [main_desc] + spec_parts
+    product.description = "\n\n".join(p for p in parts if p).strip()
 
     # --- 商品管理コード（URLから抽出）---
     m = re.search(r"/([^/]+)/?$", url.rstrip("/"))
