@@ -49,6 +49,9 @@ _EN_TO_JA_COLOR = {
     "ivory": "アイボリー", "offwhite": "オフホワイト", "cream": "クリーム",
     "lightblue": "ライトブルー", "lightgray": "ライトグレー", "lightgrey": "ライトグレー",
     "darkbrown": "ダークブラウン", "darkblue": "ダークブルー",
+    "rose": "ローズ", "mint": "ミント", "lavender": "ラベンダー",
+    "mustard": "マスタード", "terracotta": "テラコッタ", "sage": "セージ",
+    "coral": "コーラル", "teal": "ティール", "olive": "オリーブ",
 }
 
 def _color_from_variant_id(variant_id: str) -> str:
@@ -114,27 +117,39 @@ def fetch_rakuten_product(url: str) -> RakutenProduct:
     }
     resp = requests.get(url, headers=headers, timeout=15)
     resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "html.parser")
+    # エンコーディングを自動検出（強制UTF-8にしない）
+    if resp.encoding and resp.encoding.lower() in ("utf-8", "utf8"):
+        soup = BeautifulSoup(resp.text, "html.parser")
+    else:
+        soup = BeautifulSoup(resp.content, "html.parser", from_encoding=resp.apparent_encoding)
 
     product = RakutenProduct()
 
     # --- 商品名 ---
-    og_title = soup.find("meta", property="og:title")
-    raw_name = og_title["content"].strip() if og_title and og_title.get("content") else ""
-    if not raw_name:
+    # 1) itemInfoSku.title（JSON内、文字化け再デコード対応）
+    item_json_pre = _extract_item_json(soup)
+    raw_name = ""
+    if item_json_pre:
+        raw_name = _decode_selector_value(item_json_pre.get("title", ""))
+    # 2) og:title フォールバック
+    if not raw_name or "\ufffd" in raw_name:
+        og_title = soup.find("meta", property="og:title")
+        og_raw = og_title["content"].strip() if og_title and og_title.get("content") else ""
+        og_decoded = _decode_selector_value(og_raw)
+        if og_decoded and "\ufffd" not in og_decoded:
+            raw_name = og_decoded
+    # 3) h1 フォールバック
+    if not raw_name or "\ufffd" in raw_name:
         h1 = soup.find("h1")
         raw_name = h1.get_text(strip=True) if h1 else ""
-    # 【楽天市場】 などのプレフィックスを除去
     raw_name = re.sub(r"^【[^】]*】", "", raw_name).strip()
-    # ：ショップ名 などのサフィックスを除去（全角・半角コロン）
     raw_name = re.sub(r"[：:][^：:]+$", "", raw_name).strip()
     product.name = raw_name[:130]
 
     # --- 価格 ---
-    # 優先度順に複数パターンを試みる
     price_candidates = [
         soup.find("meta", property="product:price:amount"),
-        soup.find("meta", itemprop="price"),
+        soup.find("meta", attrs={"itemprop": "price"}),
     ]
     for meta in price_candidates:
         if meta and meta.get("content"):
@@ -144,13 +159,18 @@ def fetch_rakuten_product(url: str) -> RakutenProduct:
                 break
     if not product.price:
         for sel in ["span.price2", ".price2", "[class*='price--']",
-                    "[itemprop='price']", ".item_price", "#priceCalculationConfig"]:
+                    "[itemprop='price']", ".item_price"]:
             el = soup.select_one(sel)
             if el:
                 digits = re.sub(r"[^\d]", "", el.get_text())
                 if digits:
                     product.price = digits
                     break
+    if not product.price:
+        # itemInfoSku.sku[0].taxIncludedPrice から取得
+        skus_pre = item_json_pre.get("sku", []) if item_json_pre else []
+        if skus_pre and skus_pre[0].get("taxIncludedPrice"):
+            product.price = str(int(skus_pre[0]["taxIncludedPrice"]))
     if not product.price:
         # JSON-LD から価格を取得
         for script in soup.find_all("script", type="application/ld+json"):
